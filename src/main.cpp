@@ -3,8 +3,6 @@
 #include "edge-impulse-sdk/dsp/image/image.hpp"
 #include "esp_camera.h"
 #include "esp_heap_caps.h"
-
-// --- SD CARD LIBRARIES ---
 #include <SPI.h>
 #include <FS.h>
 #include <SD.h>
@@ -46,12 +44,13 @@ static bool camera_ready = false;
 static bool sd_ready = false;
 static uint8_t *snapshot_buf = nullptr;
 static unsigned long last_inference = 0;
-static uint32_t image_counter = 0; // Will be updated at boot
+static uint32_t image_counter = 0;
 
 /* ================= FUNCTION PROTOTYPES ================= */
 bool init_camera();
 bool run_pipeline();
-void log_to_sd(const char* status, float bg, float bh, float bo, uint8_t* jpg_buf, size_t jpg_len, int latency);
+// Updated log signature to include X, Y, W, H
+void log_to_sd(const char* status, float bg, float bh, float bo, uint8_t* jpg_buf, size_t jpg_len, int latency, int x, int y, int w, int h);
 void blink_healthy();
 void blink_greening();
 void blink_other();
@@ -73,7 +72,7 @@ void setup() {
     unsigned long start_time = millis();
     while (!Serial && (millis() - start_time < 5000)) { delay(10); }
 
-    Serial.println("\n=== HLB System: Session Persistence Mode ===");
+    Serial.println("\n=== HLB System: Spatial Data Edition ===");
     
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, HIGH); 
@@ -83,12 +82,9 @@ void setup() {
     SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
     if (SD.begin(SD_CS_PIN, SPI, 4000000)) {
         sd_ready = true;
-        
-        // 1. Scan SD card to find the last saved image number
         find_next_file_index();
-        Serial.printf("Next image index: %lu\n", image_counter);
-
-        // 2. Write Header if file is new
+        
+        // Write Header if file is new - Added Bounding Box columns
         if (!SD.exists("/hlb_log.csv")) {
             File logFile = SD.open("/hlb_log.csv", FILE_WRITE);
             if (logFile) {
@@ -97,22 +93,16 @@ void setup() {
             }
         }
 
-        // 3. Log "NEW SESSION" (Thesis Pro-Tip)
         File logFile = SD.open("/hlb_log.csv", FILE_APPEND);
         if (logFile) {
-            logFile.println("0,--- NEW_SESSION ---,N/A,0,0,0,0");
+            logFile.println("0,--- NEW_SESSION ---,N/A,0,0,0,0,0,0,0,0");
             logFile.close();
         }
-    } else {
-        Serial.println("SD Init Failed.");
     }
 
     if (init_camera()) {
         camera_ready = true;
-        Serial.println("Camera Ready.");
-    } else {
-        Serial.println("Camera Init Failed.");
-        while(1);
+        Serial.println("System Ready.");
     }
 }
 
@@ -123,7 +113,6 @@ void loop() {
     }
 }
 
-// Scans SD card for existing files to avoid overwriting
 void find_next_file_index() {
     uint32_t index = 0;
     while (index < 99999) {
@@ -178,8 +167,6 @@ bool run_pipeline() {
     };
 
     ei_impulse_result_t result = {0};
-    
-    // TRACK LATENCY
     unsigned long start_inference = millis();
     EI_IMPULSE_ERROR err = run_classifier(&signal, &result, false);
     int inference_ms = (int)(millis() - start_inference);
@@ -191,6 +178,7 @@ bool run_pipeline() {
     }
 
     float bg = 0, bh = 0, bo = 0;
+    int bx = 0, by = 0, bw = 0, bh_dim = 0; // Bounding box variables
     const char* status = "NOTHING";
     
     Serial.printf("--- Inference Result (%d ms) ---\n", inference_ms);
@@ -198,25 +186,31 @@ bool run_pipeline() {
         auto bb = result.bounding_boxes[i];
         if (bb.value < CONFIDENCE_THRESHOLD) continue;
         
+        // Print detailed spatial data to Serial
         Serial.printf("%s: %.2f [x:%d y:%d w:%d h:%d]\n", bb.label, bb.value, bb.x, bb.y, bb.width, bb.height);
         
         if (String(bb.label) == "Greening") { 
-            bg = max(bg, bb.value); 
+            if (bb.value > bg) { 
+                bg = bb.value; bx = bb.x; by = bb.y; bw = bb.width; bh_dim = bb.height; 
+            }
             status = "GREENING"; 
         } else if (String(bb.label) == "Healthy") { 
-            bh = max(bh, bb.value); 
+            if (bb.value > bh && strcmp(status, "GREENING") != 0) { 
+                bh = bb.value; bx = bb.x; by = bb.y; bw = bb.width; bh_dim = bb.height; 
+            }
             if(strcmp(status, "GREENING") != 0) status = "HEALTHY"; 
         } else { 
-            bo = max(bo, bb.value); 
+            if (bb.value > bo && strcmp(status, "GREENING") != 0) { 
+                bo = bb.value; bx = bb.x; by = bb.y; bw = bb.width; bh_dim = bb.height; 
+            }
             if(strcmp(status, "GREENING") != 0) status = "OTHER"; 
         }
     }
     Serial.printf("FINAL DECISION: %s\n", status);
 
-    // Logging
-    log_to_sd(status, bg, bh, bo, fb->buf, fb->len, inference_ms);
+    // Logging now includes spatial data
+    log_to_sd(status, bg, bh, bo, fb->buf, fb->len, inference_ms, bx, by, bw, bh_dim);
 
-    // Blink
     if (strcmp(status, "GREENING") == 0) blink_greening();
     else if (strcmp(status, "OTHER") == 0) blink_other();
     else if (strcmp(status, "HEALTHY") == 0) blink_healthy();
@@ -226,7 +220,7 @@ bool run_pipeline() {
     return true;
 }
 
-void log_to_sd(const char* status, float bg, float bh, float bo, uint8_t* jpg_buf, size_t jpg_len, int latency) {
+void log_to_sd(const char* status, float bg, float bh, float bo, uint8_t* jpg_buf, size_t jpg_len, int latency, int x, int y, int w, int h) {
     if (!sd_ready) return;
 
     digitalWrite(LED_PIN, HIGH);
@@ -235,34 +229,21 @@ void log_to_sd(const char* status, float bg, float bh, float bo, uint8_t* jpg_bu
     char filename[32];
     snprintf(filename, sizeof(filename), "/img_%05lu.jpg", image_counter);
 
-    // Write JPEG Image
     File imgFile = SD.open(filename, FILE_WRITE);
     if (imgFile) {
         imgFile.write(jpg_buf, jpg_len);
         imgFile.close();
     }
 
-    // Write CSV Entry with Latency Column
     File logFile = SD.open("/hlb_log.csv", FILE_APPEND);
     if (logFile) {
-        logFile.printf("%lu,%s,%s,%.2f,%.2f,%.2f,%d\n", millis(), status, filename, bg, bh, bo, latency);
+        // CSV: ms, status, file, green%, healthy%, other%, latency, x, y, w, h
+        logFile.printf("%lu,%s,%s,%.2f,%.2f,%.2f,%d,%d,%d,%d,%d\n", millis(), status, filename, bg, bh, bo, latency, x, y, w, h);
         logFile.close();
         image_counter++;
     }
 }
 
-void blink_healthy() {
-    digitalWrite(LED_PIN, LOW); delay(150); digitalWrite(LED_PIN, HIGH);
-}
-
-void blink_other() {
-    for (int i = 0; i < 2; i++) {
-        digitalWrite(LED_PIN, LOW); delay(250); digitalWrite(LED_PIN, HIGH); delay(250);
-    }
-}
-
-void blink_greening() {
-    for (int i = 0; i < 6; i++) {
-        digitalWrite(LED_PIN, LOW); delay(80); digitalWrite(LED_PIN, HIGH); delay(80);
-    }
-}
+void blink_healthy() { digitalWrite(LED_PIN, LOW); delay(150); digitalWrite(LED_PIN, HIGH); }
+void blink_other() { for (int i = 0; i < 2; i++) { digitalWrite(LED_PIN, LOW); delay(250); digitalWrite(LED_PIN, HIGH); delay(250); } }
+void blink_greening() { for (int i = 0; i < 6; i++) { digitalWrite(LED_PIN, LOW); delay(80); digitalWrite(LED_PIN, HIGH); delay(80); } }
