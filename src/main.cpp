@@ -4,6 +4,11 @@
 #include "esp_camera.h"
 #include "esp_heap_caps.h"
 
+// --- ADDED FOR SD CARD ---
+#include <SPI.h>
+#include <FS.h>
+#include <SD.h>
+
 /* ================= CAMERA PINS ================= */
 
 #define PWDN_GPIO_NUM     -1
@@ -24,9 +29,17 @@
 #define HREF_GPIO_NUM     47
 #define PCLK_GPIO_NUM     13
 
+/* ================= SD CARD PINS ================= */
+// Notice: Seeed's wiki has a typo listing MOSI as GPIO10. 
+// It actually maps to D10, which is GPIO9. 
+#define SD_CS_PIN         21
+#define SD_SCK_PIN        7
+#define SD_MISO_PIN       8
+#define SD_MOSI_PIN       9
+
 /* ================= USER CONFIG ================= */
 
-#define LED_PIN                    21
+#define LED_PIN           21
 
 #define INFERENCE_INTERVAL_MS      2000
 #define CONFIDENCE_THRESHOLD       0.70f
@@ -41,6 +54,7 @@
 /* ================= GLOBALS ================= */
 
 static bool camera_ready = false;
+static bool sd_ready = false; // Added flag for SD card state
 
 static uint8_t *snapshot_buf = nullptr;
 
@@ -90,39 +104,53 @@ void blink_healthy();
 void blink_greening();
 void blink_other();
 
+// Added logging declaration
+void log_inference_to_sd(const char* status, float conf_greening, float conf_healthy, float conf_other);
+
 static int ei_camera_get_data(size_t offset,
                               size_t length,
                               float *out_ptr);
 
 /* ================= SETUP ================= */
 
+/* ================= SETUP ================= */
+
 void setup() {
-
     Serial.begin(115200);
-    delay(1000);
+    
+    // Wait for Serial to catch up
+    unsigned long start_time = millis();
+    while (!Serial && (millis() - start_time < 5000)) { delay(10); }
 
-    Serial.println("\n=== HLB Detection System ===");
+    Serial.println("\n=== HLB System: Shared Pin Mode ===");
 
-    pinMode(LED_PIN, OUTPUT);
-
-    // XIAO ESP32S3 LED is active LOW
-    digitalWrite(LED_PIN, HIGH);
+    // GPIO 21 is our LED AND our SD CS
+    pinMode(21, OUTPUT);
+    digitalWrite(21, HIGH); // LED Off & SD Deselected
 
     if (!psramFound()) {
         Serial.println("ERROR: PSRAM NOT FOUND");
         while (1);
     }
 
-    Serial.printf("Free Heap: %u\n", ESP.getFreeHeap());
-    Serial.printf("Free PSRAM: %u\n", ESP.getFreePsram());
+    // SD Initialization
+    SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+    
+    if (!SD.begin(SD_CS_PIN)) {
+        Serial.println("SD Mount Failed - Check formatting (FAT32)");
+    } else {
+        sd_ready = true;
+        Serial.println("SD Card Ready on GPIO 21");
+        
+        // Brief flicker to show SD is alive
+        digitalWrite(21, LOW); delay(100); digitalWrite(21, HIGH);
+    }
 
     if (!init_camera()) {
         Serial.println("Camera init failed");
         while (1);
     }
-
-    Serial.println("Camera initialized");
-    Serial.println("System ready");
+    Serial.println("System Ready");
 }
 
 /* ================= MAIN LOOP ================= */
@@ -241,46 +269,29 @@ void loop() {
 
     /*
         PRIORITY SYSTEM
-
         Greening > Other > Healthy
-
         Since camera continuously detects objects,
         we only show the MOST IMPORTANT status.
     */
 
     if (greening_detected) {
-
-        Serial.printf(
-            "STATUS: GREENING (%.2f)\n",
-            best_greening
-        );
-
+        Serial.printf("STATUS: GREENING (%.2f)\n", best_greening);
+        log_inference_to_sd("GREENING", best_greening, best_healthy, best_other);
         blink_greening();
     }
-
     else if (other_detected) {
-
-        Serial.printf(
-            "STATUS: OTHER ISSUE (%.2f)\n",
-            best_other
-        );
-
+        Serial.printf("STATUS: OTHER ISSUE (%.2f)\n", best_other);
+        log_inference_to_sd("OTHER", best_greening, best_healthy, best_other);
         blink_other();
     }
-
     else if (healthy_detected) {
-
-        Serial.printf(
-            "STATUS: HEALTHY (%.2f)\n",
-            best_healthy
-        );
-
+        Serial.printf("STATUS: HEALTHY (%.2f)\n", best_healthy);
+        log_inference_to_sd("HEALTHY", best_greening, best_healthy, best_other);
         blink_healthy();
     }
-
     else {
-
         Serial.println("STATUS: NOTHING DETECTED");
+        log_inference_to_sd("NOTHING", best_greening, best_healthy, best_other);
     }
 
 #endif
@@ -373,6 +384,23 @@ static int ei_camera_get_data(size_t offset,
     }
 
     return 0;
+}
+
+/* ================= SD LOGGING ================= */
+
+void log_inference_to_sd(const char* status, float conf_greening, float conf_healthy, float conf_other) {
+    if (!sd_ready) return;
+
+    // Ensure LED is OFF (Pin HIGH) before SD transaction starts
+    digitalWrite(21, HIGH); 
+    
+    File logFile = SD.open("/hlb_log.csv", FILE_APPEND);
+    if (logFile) {
+        logFile.printf("%lu,%s,%.2f,%.2f,%.2f\n", millis(), status, conf_greening, conf_healthy, conf_other);
+        logFile.close();
+    }
+    
+    // The pin is now back in 'Idle' (HIGH), ready for your blink functions!
 }
 
 /* ================= LED PATTERNS ================= */
