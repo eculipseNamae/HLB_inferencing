@@ -3,9 +3,16 @@
 #include "edge-impulse-sdk/dsp/image/image.hpp"
 #include "esp_camera.h"
 #include "esp_heap_caps.h"
+
+// --- SD CARD LIBRARIES ---
 #include <SPI.h>
 #include <FS.h>
 #include <SD.h>
+
+// --- OLED LIBRARIES ---
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
 /* ================= PINS & CONFIG ================= */
 #define PWDN_GPIO_NUM     -1
@@ -30,7 +37,13 @@
 #define SD_MISO_PIN       8
 #define SD_MOSI_PIN       9
 
-#define LED_PIN           21
+#define LED_PIN           21 // Still used for SD Chip Select
+
+// OLED Config
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 32
+#define OLED_RESET    -1 
+#define SCREEN_ADDRESS 0x3C 
 
 #define INFERENCE_INTERVAL_MS      3000
 #define CONFIDENCE_THRESHOLD       0.70f
@@ -46,15 +59,14 @@ static uint8_t *snapshot_buf = nullptr;
 static unsigned long last_inference = 0;
 static uint32_t image_counter = 0;
 
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
 /* ================= FUNCTION PROTOTYPES ================= */
 bool init_camera();
 bool run_pipeline();
-// Updated log signature to include X, Y, W, H
 void log_to_sd(const char* status, float bg, float bh, float bo, uint8_t* jpg_buf, size_t jpg_len, int latency, int x, int y, int w, int h);
-void blink_healthy();
-void blink_greening();
-void blink_other();
 void find_next_file_index();
+void update_display(const char* status, float conf, int latency);
 
 static camera_config_t camera_config = {
     .pin_pwdn = PWDN_GPIO_NUM, .pin_reset = RESET_GPIO_NUM, .pin_xclk = XCLK_GPIO_NUM,
@@ -72,8 +84,18 @@ void setup() {
     unsigned long start_time = millis();
     while (!Serial && (millis() - start_time < 5000)) { delay(10); }
 
-    Serial.println("\n=== HLB System: Spatial Data Edition ===");
-    
+    // Initialize OLED
+    if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+        Serial.println(F("SSD1306 allocation failed"));
+    } else {
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(0,0);
+        display.println("HLB SYSTEM INIT...");
+        display.display();
+    }
+
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, HIGH); 
 
@@ -84,7 +106,6 @@ void setup() {
         sd_ready = true;
         find_next_file_index();
         
-        // Write Header if file is new - Added Bounding Box columns
         if (!SD.exists("/hlb_log.csv")) {
             File logFile = SD.open("/hlb_log.csv", FILE_WRITE);
             if (logFile) {
@@ -92,7 +113,6 @@ void setup() {
                 logFile.close();
             }
         }
-
         File logFile = SD.open("/hlb_log.csv", FILE_APPEND);
         if (logFile) {
             logFile.println("0,--- NEW_SESSION ---,N/A,0,0,0,0,0,0,0,0");
@@ -102,7 +122,8 @@ void setup() {
 
     if (init_camera()) {
         camera_ready = true;
-        Serial.println("System Ready.");
+        display.println("CAMERA READY");
+        display.display();
     }
 }
 
@@ -180,66 +201,63 @@ bool run_pipeline() {
     float bg = 0, bh = 0, bo = 0;
     int bx = 0, by = 0, bw = 0, bh_dim = 0; 
     const char* status = "NOTHING";
-    bool any_object_found = false; // NEW FLAG
-    
-    Serial.printf("--- Inference Result (%d ms) ---\n", inference_ms);
+    float best_conf = 0.0f;
+    bool any_object_found = false;
+
     for (uint32_t i = 0; i < result.bounding_boxes_count; i++) {
         auto bb = result.bounding_boxes[i];
         if (bb.value < CONFIDENCE_THRESHOLD) continue;
         
-        any_object_found = true; // Mark that we actually saw something valid
-        Serial.printf("%s: %.2f [x:%d y:%d w:%d h:%d]\n", bb.label, bb.value, bb.x, bb.y, bb.width, bb.height);
-        
+        any_object_found = true;
         if (String(bb.label) == "Greening") { 
-            if (bb.value > bg) { 
-                bg = bb.value; bx = bb.x; by = bb.y; bw = bb.width; bh_dim = bb.height; 
-            }
+            if (bb.value > bg) { bg = bb.value; bx = bb.x; by = bb.y; bw = bb.width; bh_dim = bb.height; }
             status = "GREENING"; 
         } else if (String(bb.label) == "Healthy") { 
-            if (bb.value > bh && strcmp(status, "GREENING") != 0) { 
-                bh = bb.value; bx = bb.x; by = bb.y; bw = bb.width; bh_dim = bb.height; 
-            }
+            if (bb.value > bh && strcmp(status, "GREENING") != 0) { bh = bb.value; bx = bb.x; by = bb.y; bw = bb.width; bh_dim = bb.height; }
             if(strcmp(status, "GREENING") != 0) status = "HEALTHY"; 
         } else { 
-            if (bb.value > bo && strcmp(status, "GREENING") != 0) { 
-                bo = bb.value; bx = bb.x; by = bb.y; bw = bb.width; bh_dim = bb.height; 
-            }
+            if (bb.value > bo && strcmp(status, "GREENING") != 0) { bo = bb.value; bx = bb.x; by = bb.y; bw = bb.width; bh_dim = bb.height; }
             if(strcmp(status, "GREENING") != 0) status = "OTHER"; 
         }
     }
 
-    if (!any_object_found) {
-        Serial.println("FINAL DECISION: NOTHING DETECTED");
-    } else {
-        Serial.printf("FINAL DECISION: %s\n", status);
-    }
+    best_conf = (strcmp(status, "GREENING") == 0) ? bg : (strcmp(status, "HEALTHY") == 0 ? bh : bo);
 
-     // 1. Log to SD (This creates the "Activity Pulse" on the LED)
+    // Logging
     log_to_sd(status, bg, bh, bo, fb->buf, fb->len, inference_ms, bx, by, bw, bh_dim);
 
-    // 2. Clear Visual Gap (The "Dark Period")
-    // This separates the SD pulse from the result blinks
-    digitalWrite(LED_PIN, HIGH); 
-    delay(500);
-
-    // BLINK ONLY IF SOMETHING WAS ACTUALLY DETECTED
-    if (any_object_found) {
-        if (strcmp(status, "GREENING") == 0) blink_greening();
-        else if (strcmp(status, "OTHER") == 0) blink_other();
-        else if (strcmp(status, "HEALTHY") == 0) blink_healthy();
-    } else {
-        // Optional: Do nothing or a very tiny "pulse" to show the system is alive
-        digitalWrite(LED_PIN, HIGH); 
-    }
+    // OLED Update instead of LED patterns
+    update_display(status, best_conf, inference_ms);
 
     free(snapshot_buf);
     esp_camera_fb_return(fb);
     return true;
 }
 
+void update_display(const char* status, float conf, int latency) {
+    display.clearDisplay();
+    display.setCursor(0,0);
+    
+    // Header
+    display.setTextSize(1);
+    display.print("FILE ID: "); display.println(image_counter-1);
+    
+    // Status (Large text)
+    display.setTextSize(2);
+    display.setCursor(0, 10);
+    display.println(status);
+    
+    // Confidence & Latency
+    display.setTextSize(1);
+    display.setCursor(0, 25);
+    display.print("C:"); display.print((int)(conf*100)); display.print("% ");
+    display.print("L:"); display.print(latency); display.print("ms");
+    
+    display.display();
+}
+
 void log_to_sd(const char* status, float bg, float bh, float bo, uint8_t* jpg_buf, size_t jpg_len, int latency, int x, int y, int w, int h) {
     if (!sd_ready) return;
-
     digitalWrite(LED_PIN, HIGH);
     delayMicroseconds(50);
 
@@ -254,36 +272,8 @@ void log_to_sd(const char* status, float bg, float bh, float bo, uint8_t* jpg_bu
 
     File logFile = SD.open("/hlb_log.csv", FILE_APPEND);
     if (logFile) {
-        // CSV: ms, status, file, green%, healthy%, other%, latency, x, y, w, h
         logFile.printf("%lu,%s,%s,%.2f,%.2f,%.2f,%d,%d,%d,%d,%d\n", millis(), status, filename, bg, bh, bo, latency, x, y, w, h);
         logFile.close();
         image_counter++;
-    }
-}
-
-void blink_healthy() {
-    // One slow intentional blink
-    digitalWrite(LED_PIN, LOW);
-    delay(600);
-    digitalWrite(LED_PIN, HIGH);
-}
-
-void blink_other() {
-    // Two somewhat faster blinks
-    for (int i = 0; i < 2; i++) {
-        digitalWrite(LED_PIN, LOW);
-        delay(200);
-        digitalWrite(LED_PIN, HIGH);
-        if(i < 1) delay(200); // Gap between blinks
-    }
-}
-
-void blink_greening() {
-    // Three fast urgent blinks
-    for (int i = 0; i < 3; i++) {
-        digitalWrite(LED_PIN, LOW);
-        delay(120);
-        digitalWrite(LED_PIN, HIGH);
-        if(i < 2) delay(120); // Gap between blinks
     }
 }
