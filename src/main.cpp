@@ -80,7 +80,7 @@ void setup() {
     if (!psramFound()) { Serial.println("FATAL: PSRAM NOT FOUND"); while (1); }
 
     SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
-    if (SD.begin(SD_CS_PIN, SPI, 4000000)) {
+    if (SD.begin(SD_CS_PIN, SPI, 16000000)) {
         sd_ready = true;
         find_next_file_index();
         
@@ -214,8 +214,13 @@ bool run_pipeline() {
         Serial.printf("FINAL DECISION: %s\n", status);
     }
 
-    // Log everything to SD (even "NOTHING" entries are good for data integrity)
+     // 1. Log to SD (This creates the "Activity Pulse" on the LED)
     log_to_sd(status, bg, bh, bo, fb->buf, fb->len, inference_ms, bx, by, bw, bh_dim);
+
+    // 2. Clear Visual Gap (The "Dark Period")
+    // This separates the SD pulse from the result blinks
+    digitalWrite(LED_PIN, HIGH); 
+    delay(500);
 
     // BLINK ONLY IF SOMETHING WAS ACTUALLY DETECTED
     if (any_object_found) {
@@ -241,11 +246,11 @@ void log_to_sd(const char* status, float bg, float bh, float bo, uint8_t* jpg_bu
     char filename[32];
     snprintf(filename, sizeof(filename), "/img_%05lu.jpg", image_counter);
 
-    // File imgFile = SD.open(filename, FILE_WRITE);
-    // if (imgFile) {
-    //     imgFile.write(jpg_buf, jpg_len);
-    //     imgFile.close();
-    // }
+    File imgFile = SD.open(filename, FILE_WRITE);
+    if (imgFile) {
+        imgFile.write(jpg_buf, jpg_len);
+        imgFile.close();
+    }
 
     File logFile = SD.open("/hlb_log.csv", FILE_APPEND);
     if (logFile) {
@@ -256,6 +261,29 @@ void log_to_sd(const char* status, float bg, float bh, float bo, uint8_t* jpg_bu
     }
 }
 
-void blink_healthy() { digitalWrite(LED_PIN, LOW); delay(150); digitalWrite(LED_PIN, HIGH); }
-void blink_other() { for (int i = 0; i < 2; i++) { digitalWrite(LED_PIN, LOW); delay(250); digitalWrite(LED_PIN, HIGH); delay(250); } }
-void blink_greening() { for (int i = 0; i < 6; i++) { digitalWrite(LED_PIN, LOW); delay(80); digitalWrite(LED_PIN, HIGH); delay(80); } }
+void blink_healthy() {
+    // One slow intentional blink
+    digitalWrite(LED_PIN, LOW);
+    delay(600);
+    digitalWrite(LED_PIN, HIGH);
+}
+
+void blink_other() {
+    // Two somewhat faster blinks
+    for (int i = 0; i < 2; i++) {
+        digitalWrite(LED_PIN, LOW);
+        delay(200);
+        digitalWrite(LED_PIN, HIGH);
+        if(i < 1) delay(200); // Gap between blinks
+    }
+}
+
+void blink_greening() {
+    // Three fast urgent blinks
+    for (int i = 0; i < 3; i++) {
+        digitalWrite(LED_PIN, LOW);
+        delay(120);
+        digitalWrite(LED_PIN, HIGH);
+        if(i < 2) delay(120); // Gap between blinks
+    }
+}
