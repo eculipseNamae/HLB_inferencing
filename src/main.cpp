@@ -178,15 +178,16 @@ bool run_pipeline() {
     }
 
     float bg = 0, bh = 0, bo = 0;
-    int bx = 0, by = 0, bw = 0, bh_dim = 0; // Bounding box variables
+    int bx = 0, by = 0, bw = 0, bh_dim = 0; 
     const char* status = "NOTHING";
+    bool any_object_found = false; // NEW FLAG
     
     Serial.printf("--- Inference Result (%d ms) ---\n", inference_ms);
     for (uint32_t i = 0; i < result.bounding_boxes_count; i++) {
         auto bb = result.bounding_boxes[i];
         if (bb.value < CONFIDENCE_THRESHOLD) continue;
         
-        // Print detailed spatial data to Serial
+        any_object_found = true; // Mark that we actually saw something valid
         Serial.printf("%s: %.2f [x:%d y:%d w:%d h:%d]\n", bb.label, bb.value, bb.x, bb.y, bb.width, bb.height);
         
         if (String(bb.label) == "Greening") { 
@@ -206,14 +207,25 @@ bool run_pipeline() {
             if(strcmp(status, "GREENING") != 0) status = "OTHER"; 
         }
     }
-    Serial.printf("FINAL DECISION: %s\n", status);
 
-    // Logging now includes spatial data
+    if (!any_object_found) {
+        Serial.println("FINAL DECISION: NOTHING DETECTED");
+    } else {
+        Serial.printf("FINAL DECISION: %s\n", status);
+    }
+
+    // Log everything to SD (even "NOTHING" entries are good for data integrity)
     log_to_sd(status, bg, bh, bo, fb->buf, fb->len, inference_ms, bx, by, bw, bh_dim);
 
-    if (strcmp(status, "GREENING") == 0) blink_greening();
-    else if (strcmp(status, "OTHER") == 0) blink_other();
-    else if (strcmp(status, "HEALTHY") == 0) blink_healthy();
+    // BLINK ONLY IF SOMETHING WAS ACTUALLY DETECTED
+    if (any_object_found) {
+        if (strcmp(status, "GREENING") == 0) blink_greening();
+        else if (strcmp(status, "OTHER") == 0) blink_other();
+        else if (strcmp(status, "HEALTHY") == 0) blink_healthy();
+    } else {
+        // Optional: Do nothing or a very tiny "pulse" to show the system is alive
+        digitalWrite(LED_PIN, HIGH); 
+    }
 
     free(snapshot_buf);
     esp_camera_fb_return(fb);
@@ -229,11 +241,11 @@ void log_to_sd(const char* status, float bg, float bh, float bo, uint8_t* jpg_bu
     char filename[32];
     snprintf(filename, sizeof(filename), "/img_%05lu.jpg", image_counter);
 
-    File imgFile = SD.open(filename, FILE_WRITE);
-    if (imgFile) {
-        imgFile.write(jpg_buf, jpg_len);
-        imgFile.close();
-    }
+    // File imgFile = SD.open(filename, FILE_WRITE);
+    // if (imgFile) {
+    //     imgFile.write(jpg_buf, jpg_len);
+    //     imgFile.close();
+    // }
 
     File logFile = SD.open("/hlb_log.csv", FILE_APPEND);
     if (logFile) {
