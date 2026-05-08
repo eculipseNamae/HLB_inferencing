@@ -37,36 +37,54 @@
 #define SD_MISO_PIN       8
 #define SD_MOSI_PIN       9
 
-#define LED_PIN           21 // Still used for SD Chip Select
+#define LED_PIN           21
 
 // OLED Config
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 32
-#define OLED_RESET    -1 
-#define SCREEN_ADDRESS 0x3C 
+#define SCREEN_WIDTH      128
+#define SCREEN_HEIGHT     32
+#define OLED_RESET        -1
+#define SCREEN_ADDRESS    0x3C
 
-#define INFERENCE_INTERVAL_MS      3000
-#define CONFIDENCE_THRESHOLD       0.70f
+#define INFERENCE_INTERVAL_MS   3000
+#define CONFIDENCE_THRESHOLD    0.70f
 
-#define RAW_WIDTH                  320
-#define RAW_HEIGHT                 240
-#define RAW_RGB_SIZE               (RAW_WIDTH * RAW_HEIGHT * 3)
+#define RAW_WIDTH               320
+#define RAW_HEIGHT              240
+#define RAW_RGB_SIZE            (RAW_WIDTH * RAW_HEIGHT * 3)
+
+// ── Session ID config ─────────────────────────────────────────────────────────
+// A session ID is generated once at boot from boot count + uptime salt.
+// Format: /S00042/ — all images and the CSV for that session live in that folder.
+// Boot count is stored in /boot_count.txt so it survives power cycles.
+// Max 99999 sessions before the counter wraps (effectively never for field use).
+#define SESSION_FOLDER_FMT   "/S%05lu"
+#define IMAGE_FILE_FMT       "/S%05lu/%04lu.jpg"
+#define CSV_FILE_FMT         "/S%05lu/log.csv"
 
 /* ================= GLOBALS ================= */
-static bool camera_ready = false;
-static bool sd_ready = false;
-static uint8_t *snapshot_buf = nullptr;
-static unsigned long last_inference = 0;
-static uint32_t image_counter = 0;
+static bool          camera_ready    = false;
+static bool          sd_ready        = false;
+static uint8_t      *snapshot_buf    = nullptr;
+static unsigned long last_inference  = 0;
+
+// Session state — set once in setup(), never changes during a run
+static uint32_t session_id      = 0;   // e.g. 42
+static uint32_t frame_counter   = 0;   // resets to 0 each session, max 9999
+static char     session_folder[16];    // "/S00042"
+static char     csv_path[24];          // "/S00042/log.csv"
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 /* ================= FUNCTION PROTOTYPES ================= */
 bool init_camera();
 bool run_pipeline();
-void log_to_sd(const char* status, float bg, float bh, float bo, uint8_t* jpg_buf, size_t jpg_len, int latency, int x, int y, int w, int h);
-void find_next_file_index();
-void update_display(const char* status, float conf, int latency);
+void log_to_sd(const char* status, float bg, float bh, float bo,
+               uint8_t* jpg_buf, size_t jpg_len,
+               int latency, int x, int y, int w, int h,
+               bool above_threshold);
+uint32_t load_and_increment_boot_count();
+void     init_session();
+void     update_display(const char* status, float conf, int latency);
 
 static camera_config_t camera_config = {
     .pin_pwdn = PWDN_GPIO_NUM, .pin_reset = RESET_GPIO_NUM, .pin_xclk = XCLK_GPIO_NUM,
@@ -76,48 +94,94 @@ static camera_config_t camera_config = {
     .pin_vsync = VSYNC_GPIO_NUM, .pin_href = HREF_GPIO_NUM, .pin_pclk = PCLK_GPIO_NUM,
     .xclk_freq_hz = 20000000, .ledc_timer = LEDC_TIMER_0, .ledc_channel = LEDC_CHANNEL_0,
     .pixel_format = PIXFORMAT_JPEG, .frame_size = FRAMESIZE_QVGA,
-    .jpeg_quality = 12, .fb_count = 1, .fb_location = CAMERA_FB_IN_PSRAM, .grab_mode = CAMERA_GRAB_WHEN_EMPTY
+    .jpeg_quality = 12, .fb_count = 1,
+    .fb_location = CAMERA_FB_IN_PSRAM, .grab_mode = CAMERA_GRAB_WHEN_EMPTY
 };
 
+/* ================= BOOT COUNT ================= */
+// Reads /boot_count.txt, increments it, writes it back.
+// Returns the NEW count (i.e. this session's ID).
+// If the file is missing or unreadable, starts from 1.
+uint32_t load_and_increment_boot_count() {
+    uint32_t count = 0;
+
+    File f = SD.open("/boot_count.txt", FILE_READ);
+    if (f) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        count = (uint32_t)line.toInt();
+        f.close();
+    }
+
+    count = (count >= 99999) ? 1 : count + 1;  // wrap gracefully
+
+    f = SD.open("/boot_count.txt", FILE_WRITE); // FILE_WRITE truncates
+    if (f) {
+        f.println(count);
+        f.close();
+    }
+
+    return count;
+}
+
+/* ================= SESSION INIT ================= */
+void init_session() {
+    session_id    = load_and_increment_boot_count();
+    frame_counter = 0;
+
+    snprintf(session_folder, sizeof(session_folder), SESSION_FOLDER_FMT, session_id);
+    snprintf(csv_path,       sizeof(csv_path),       CSV_FILE_FMT,       session_id);
+
+    // Create session folder
+    if (!SD.exists(session_folder)) {
+        SD.mkdir(session_folder);
+    }
+
+    // Write CSV header for this session
+    File logFile = SD.open(csv_path, FILE_WRITE);
+    if (logFile) {
+        logFile.println("Frame,Timestamp_ms,Status,Above_Threshold,Image_File,"
+                        "Conf_Greening,Conf_Healthy,Conf_Other,"
+                        "Inference_ms,BB_X,BB_Y,BB_W,BB_H");
+        logFile.close();
+    }
+
+    Serial.printf("Session ID: %lu  Folder: %s\r\n", session_id, session_folder);
+}
+
+/* ================= SETUP ================= */
 void setup() {
     Serial.begin(115200);
     unsigned long start_time = millis();
     while (!Serial && (millis() - start_time < 5000)) { delay(10); }
 
-    // Initialize OLED
-    if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
         Serial.println(F("SSD1306 allocation failed"));
     } else {
         display.clearDisplay();
         display.setTextSize(1);
         display.setTextColor(SSD1306_WHITE);
-        display.setCursor(0,0);
+        display.setCursor(0, 0);
         display.println("HLB SYSTEM INIT...");
         display.display();
     }
 
     pinMode(LED_PIN, OUTPUT);
-    digitalWrite(LED_PIN, HIGH); 
+    digitalWrite(LED_PIN, HIGH);
 
     if (!psramFound()) { Serial.println("FATAL: PSRAM NOT FOUND"); while (1); }
 
     SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
     if (SD.begin(SD_CS_PIN, SPI, 16000000)) {
         sd_ready = true;
-        find_next_file_index();
-        
-        if (!SD.exists("/hlb_log.csv")) {
-            File logFile = SD.open("/hlb_log.csv", FILE_WRITE);
-            if (logFile) {
-                logFile.println("Timestamp_ms,Status,Image_File,Conf_Greening,Conf_Healthy,Conf_Other,Inference_ms,BB_X,BB_Y,BB_W,BB_H");
-                logFile.close();
-            }
-        }
-        File logFile = SD.open("/hlb_log.csv", FILE_APPEND);
-        if (logFile) {
-            logFile.println("0,--- NEW_SESSION ---,N/A,0,0,0,0,0,0,0,0");
-            logFile.close();
-        }
+        init_session();   // replaces find_next_file_index()
+
+        // Show session ID on OLED
+        display.print("SESSION: ");
+        display.println(session_id);
+        display.display();
+    } else {
+        Serial.println("WARN: SD not found — logging disabled");
     }
 
     if (init_camera()) {
@@ -125,8 +189,11 @@ void setup() {
         display.println("CAMERA READY");
         display.display();
     }
+
+    Serial.printf("Ready. Session %lu | CSV: %s\r\n", session_id, csv_path);
 }
 
+/* ================= LOOP ================= */
 void loop() {
     if (millis() - last_inference >= INFERENCE_INTERVAL_MS) {
         last_inference = millis();
@@ -134,19 +201,7 @@ void loop() {
     }
 }
 
-void find_next_file_index() {
-    uint32_t index = 0;
-    while (index < 99999) {
-        char filename[32];
-        snprintf(filename, sizeof(filename), "/img_%05lu.jpg", index);
-        if (!SD.exists(filename)) {
-            image_counter = index;
-            return;
-        }
-        index++;
-    }
-}
-
+/* ================= CAMERA INIT ================= */
 bool init_camera() {
     esp_err_t err = esp_camera_init(&camera_config);
     if (err != ESP_OK) return false;
@@ -156,8 +211,15 @@ bool init_camera() {
     return true;
 }
 
+/* ================= PIPELINE ================= */
 bool run_pipeline() {
     if (!camera_ready) return false;
+
+    // Guard: frame_counter uses 4 digits (0000–9999). If somehow exceeded,
+    // log a warning but keep going — the filename will truncate gracefully.
+    if (frame_counter > 9999) {
+        Serial.println("WARN: frame_counter exceeded 9999 in this session");
+    }
 
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) return false;
@@ -169,9 +231,8 @@ bool run_pipeline() {
     }
 
     fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, snapshot_buf);
-    
     ei::image::processing::crop_and_interpolate_rgb888(
-        snapshot_buf, RAW_WIDTH, RAW_HEIGHT, 
+        snapshot_buf, RAW_WIDTH, RAW_HEIGHT,
         snapshot_buf, EI_CLASSIFIER_INPUT_WIDTH, EI_CLASSIFIER_INPUT_HEIGHT
     );
 
@@ -179,101 +240,143 @@ bool run_pipeline() {
     signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
     signal.get_data = [](size_t offset, size_t length, float *out_ptr) -> int {
         size_t pixel_ix = offset * 3;
-        size_t out_ix = 0;
+        size_t out_ix   = 0;
         while (length--) {
-            out_ptr[out_ix++] = (float)((uint32_t)snapshot_buf[pixel_ix+2]<<16 | (uint32_t)snapshot_buf[pixel_ix+1]<<8 | (uint32_t)snapshot_buf[pixel_ix]);
+            out_ptr[out_ix++] = (float)(
+                (uint32_t)snapshot_buf[pixel_ix + 2] << 16 |
+                (uint32_t)snapshot_buf[pixel_ix + 1] << 8  |
+                (uint32_t)snapshot_buf[pixel_ix]);
             pixel_ix += 3;
         }
         return 0;
     };
 
     ei_impulse_result_t result = {0};
-    unsigned long start_inference = millis();
+    unsigned long t0 = millis();
     EI_IMPULSE_ERROR err = run_classifier(&signal, &result, false);
-    int inference_ms = (int)(millis() - start_inference);
-    
+    int inference_ms = (int)(millis() - t0);
+
+    free(snapshot_buf);
+    snapshot_buf = nullptr;
+
     if (err != EI_IMPULSE_OK) {
-        free(snapshot_buf);
         esp_camera_fb_return(fb);
         return false;
     }
 
-    float bg = 0, bh = 0, bo = 0;
-    int bx = 0, by = 0, bw = 0, bh_dim = 0; 
-    const char* status = "NOTHING";
-    float best_conf = 0.0f;
-    bool any_object_found = false;
+    // ── Pass 1: collect raw scores (no threshold) ─────────────────────────────
+    float log_bg = 0, log_bh = 0, log_bo = 0;
+    int   log_bx = 0, log_by = 0, log_bw = 0, log_bh_dim = 0;
+    const char* log_status = "NOTHING";
 
     for (uint32_t i = 0; i < result.bounding_boxes_count; i++) {
         auto bb = result.bounding_boxes[i];
-        if (bb.value < CONFIDENCE_THRESHOLD) continue;
-        
-        any_object_found = true;
-        if (String(bb.label) == "Greening") { 
-            if (bb.value > bg) { bg = bb.value; bx = bb.x; by = bb.y; bw = bb.width; bh_dim = bb.height; }
-            status = "GREENING"; 
-        } else if (String(bb.label) == "Healthy") { 
-            if (bb.value > bh && strcmp(status, "GREENING") != 0) { bh = bb.value; bx = bb.x; by = bb.y; bw = bb.width; bh_dim = bb.height; }
-            if(strcmp(status, "GREENING") != 0) status = "HEALTHY"; 
-        } else { 
-            if (bb.value > bo && strcmp(status, "GREENING") != 0) { bo = bb.value; bx = bb.x; by = bb.y; bw = bb.width; bh_dim = bb.height; }
-            if(strcmp(status, "GREENING") != 0) status = "OTHER"; 
+        if (bb.value == 0) continue;
+
+        if (String(bb.label) == "Greening") {
+            if (bb.value > log_bg) {
+                log_bg = bb.value;
+                log_bx = bb.x; log_by = bb.y;
+                log_bw = bb.width; log_bh_dim = bb.height;
+            }
+            log_status = "GREENING";
+
+        } else if (String(bb.label) == "Healthy") {
+            if (bb.value > log_bh) log_bh = bb.value;
+            if (strcmp(log_status, "GREENING") != 0) {
+                log_status = "HEALTHY";
+                log_bx = bb.x; log_by = bb.y;
+                log_bw = bb.width; log_bh_dim = bb.height;
+            }
+
+        } else {
+            if (bb.value > log_bo) log_bo = bb.value;
+            if (strcmp(log_status, "GREENING") != 0 && strcmp(log_status, "HEALTHY") != 0) {
+                log_status = "OTHER";
+                log_bx = bb.x; log_by = bb.y;
+                log_bw = bb.width; log_bh_dim = bb.height;
+            }
         }
     }
 
-    best_conf = (strcmp(status, "GREENING") == 0) ? bg : (strcmp(status, "HEALTHY") == 0 ? bh : bo);
+    // ── Pass 2: apply threshold for display only ──────────────────────────────
+    float       display_conf    = 0.0f;
+    const char* disp_status     = "NOTHING";
+    bool        above_threshold = false;
 
-    // Logging
-    log_to_sd(status, bg, bh, bo, fb->buf, fb->len, inference_ms, bx, by, bw, bh_dim);
+    if (log_bg >= CONFIDENCE_THRESHOLD && log_bg >= log_bh && log_bg >= log_bo) {
+        disp_status = "GREENING"; display_conf = log_bg; above_threshold = true;
+    } else if (log_bh >= CONFIDENCE_THRESHOLD && log_bh >= log_bo) {
+        disp_status = "HEALTHY";  display_conf = log_bh; above_threshold = true;
+    } else if (log_bo >= CONFIDENCE_THRESHOLD) {
+        disp_status = "OTHER";    display_conf = log_bo; above_threshold = true;
+    }
 
-    // OLED Update instead of LED patterns
-    update_display(status, best_conf, inference_ms);
+    // ── Log to SD (fb->buf still valid here) ──────────────────────────────────
+    log_to_sd(log_status, log_bg, log_bh, log_bo,
+              fb->buf, fb->len,
+              inference_ms,
+              log_bx, log_by, log_bw, log_bh_dim,
+              above_threshold);
 
-    free(snapshot_buf);
+    // Return frame buffer only AFTER log_to_sd is done with fb->buf
     esp_camera_fb_return(fb);
+
+    update_display(disp_status, display_conf, inference_ms);
     return true;
 }
 
+/* ================= DISPLAY ================= */
 void update_display(const char* status, float conf, int latency) {
     display.clearDisplay();
-    display.setCursor(0,0);
-    
-    // Header
+    display.setCursor(0, 0);
     display.setTextSize(1);
-    display.print("FILE ID: "); display.println(image_counter-1);
-    
-    // Status (Large text)
+    // Show session + frame so the user knows exactly which file they're looking at
+    display.printf("S%05lu  F:%04lu", session_id, frame_counter > 0 ? frame_counter - 1 : 0);
     display.setTextSize(2);
     display.setCursor(0, 10);
     display.println(status);
-    
-    // Confidence & Latency
     display.setTextSize(1);
     display.setCursor(0, 25);
-    display.print("C:"); display.print((int)(conf*100)); display.print("% ");
+    display.print("C:"); display.print((int)(conf * 100)); display.print("% ");
     display.print("L:"); display.print(latency); display.print("ms");
-    
     display.display();
 }
 
-void log_to_sd(const char* status, float bg, float bh, float bo, uint8_t* jpg_buf, size_t jpg_len, int latency, int x, int y, int w, int h) {
+/* ================= SD LOGGING ================= */
+void log_to_sd(const char* status, float bg, float bh, float bo,
+               uint8_t* jpg_buf, size_t jpg_len,
+               int latency, int x, int y, int w, int h,
+               bool above_threshold) {
     if (!sd_ready) return;
-    digitalWrite(LED_PIN, HIGH);
-    delayMicroseconds(50);
 
-    char filename[32];
-    snprintf(filename, sizeof(filename), "/img_%05lu.jpg", image_counter);
+    // Build image path inside the session folder: /S00042/0003.jpg
+    char img_path[32];
+    snprintf(img_path, sizeof(img_path), IMAGE_FILE_FMT, session_id, frame_counter);
 
-    File imgFile = SD.open(filename, FILE_WRITE);
+    // Write JPEG
+    File imgFile = SD.open(img_path, FILE_WRITE);
     if (imgFile) {
         imgFile.write(jpg_buf, jpg_len);
         imgFile.close();
+    } else {
+        Serial.printf("WARN: Could not write image %s\r\n", img_path);
     }
 
-    File logFile = SD.open("/hlb_log.csv", FILE_APPEND);
+    // Append CSV row
+    File logFile = SD.open(csv_path, FILE_APPEND);
     if (logFile) {
-        logFile.printf("%lu,%s,%s,%.2f,%.2f,%.2f,%d,%d,%d,%d,%d\n", millis(), status, filename, bg, bh, bo, latency, x, y, w, h);
+        logFile.printf("%lu,%lu,%s,%d,%s,%.2f,%.2f,%.2f,%d,%d,%d,%d,%d\n",
+            frame_counter,
+            millis(),
+            status,
+            above_threshold ? 1 : 0,
+            img_path,
+            bg, bh, bo,
+            latency, x, y, w, h);
         logFile.close();
-        image_counter++;
+        frame_counter++;
+    } else {
+        Serial.printf("WARN: Could not write CSV %s\r\n", csv_path);
     }
 }
