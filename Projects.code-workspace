@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": ".."
+		},
+		{
+			"name": "HLB_inferencing",
+			"path": "."
+		}
+	],
+	"settings": {}
+}
