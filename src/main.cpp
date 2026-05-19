@@ -1,5 +1,5 @@
 #include <Arduino.h>
-#include <HLB6_inferencing.h>
+#include <HLB8_inferencing.h>
 #include "edge-impulse-sdk/dsp/image/image.hpp"
 #include "esp_camera.h"
 #include "esp_heap_caps.h"
@@ -82,6 +82,12 @@ static uint32_t frame_counter   = 0;
 static char     session_folder[16];
 static char     csv_path[24];
 
+//cropping globals
+static uint8_t *crop_buf = nullptr;
+static uint8_t *crop_jpg_buf = nullptr;
+static size_t   crop_jpg_len = 0;
+
+
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // ─── NEW: WiFi globals ────────────────────────────────────────────────────────
@@ -112,6 +118,12 @@ void serve_csv();
 void serve_image();
 void serve_sessions();
 // ─────────────────────────────────────────────────────────────────────────────
+
+//debugging
+void print_debug_stats(ei_impulse_result_t &result, int inference_ms,
+                       int pipeline_ms, size_t raw_jpg_len, size_t crop_jpg_len,
+                       int sd_write_ms);
+
 
 static camera_config_t camera_config = {
     .pin_pwdn = PWDN_GPIO_NUM, .pin_reset = RESET_GPIO_NUM, .pin_xclk = XCLK_GPIO_NUM,
@@ -238,7 +250,11 @@ bool init_camera() {
 
 /* ================= PIPELINE ================= */
 bool run_pipeline() {
+
+
     if (!camera_ready) return false;
+    // debugging
+    unsigned long pipeline_start = millis();
 
     if (frame_counter > 9999) {
         Serial.println("WARN: frame_counter exceeded 9999 in this session");
@@ -254,9 +270,39 @@ bool run_pipeline() {
     }
 
     fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, snapshot_buf);
+     // ── Center-crop 320x240 → 240x240 (remove 40px from each side) ──
+    const int CROP_X      = 40;   // (320 - 240) / 2
+    const int CROP_Y      = 0;
+    const int CROP_W      = 240;
+    const int CROP_H      = 240;
+    const int CROP_STRIDE = RAW_WIDTH * 3;  // bytes per source row
+
+    crop_buf = (uint8_t*) heap_caps_malloc(CROP_W * CROP_H * 3,
+                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!crop_buf) {
+        free(snapshot_buf); snapshot_buf = nullptr;
+        esp_camera_fb_return(fb);
+        return false;
+    }
+
+    for (int row = 0; row < CROP_H; row++) {
+        memcpy(
+            crop_buf + row * CROP_W * 3,
+            snapshot_buf + (CROP_Y + row) * CROP_STRIDE + CROP_X * 3,
+            CROP_W * 3
+        );
+    }
+
+    // ── Encode the 240x240 crop to JPEG for logging ──
+    crop_jpg_buf = nullptr;
+    crop_jpg_len = 0;
+    fmt2jpg(crop_buf, CROP_W * CROP_H * 3, CROP_W, CROP_H,
+            PIXFORMAT_RGB888, 12, &crop_jpg_buf, &crop_jpg_len);
+
+    // ── Resize crop in-place to 96x96 for inference ──
     ei::image::processing::crop_and_interpolate_rgb888(
-        snapshot_buf, RAW_WIDTH, RAW_HEIGHT,
-        snapshot_buf, EI_CLASSIFIER_INPUT_WIDTH, EI_CLASSIFIER_INPUT_HEIGHT
+        crop_buf, CROP_W, CROP_H,
+        crop_buf, EI_CLASSIFIER_INPUT_WIDTH, EI_CLASSIFIER_INPUT_HEIGHT
     );
 
     ei::signal_t signal;
@@ -266,9 +312,9 @@ bool run_pipeline() {
         size_t out_ix   = 0;
         while (length--) {
             out_ptr[out_ix++] = (float)(
-                (uint32_t)snapshot_buf[pixel_ix + 2] << 16 |
-                (uint32_t)snapshot_buf[pixel_ix + 1] << 8  |
-                (uint32_t)snapshot_buf[pixel_ix]);
+                (uint32_t)crop_buf[pixel_ix + 2] << 16 |
+                (uint32_t)crop_buf[pixel_ix + 1] << 8  |
+                (uint32_t)crop_buf[pixel_ix]);
             pixel_ix += 3;
         }
         return 0;
@@ -277,12 +323,16 @@ bool run_pipeline() {
     ei_impulse_result_t result = {0};
     unsigned long t0 = millis();
     EI_IMPULSE_ERROR err = run_classifier(&signal, &result, false);
+
+
+
     int inference_ms = (int)(millis() - t0);
 
-    free(snapshot_buf);
-    snapshot_buf = nullptr;
+    free(snapshot_buf); snapshot_buf = nullptr;
+    free(crop_buf);     crop_buf     = nullptr;
 
     if (err != EI_IMPULSE_OK) {
+        if (crop_jpg_buf) { free(crop_jpg_buf); crop_jpg_buf = nullptr; }
         esp_camera_fb_return(fb);
         return false;
     }
@@ -330,14 +380,26 @@ bool run_pipeline() {
         disp_status = "OTHER";    display_conf = log_bo; above_threshold = true;
     }
 
+    unsigned long sd_t0 = millis();
     log_to_sd(log_status, log_bg, log_bh, log_bo,
-              fb->buf, fb->len,
-              inference_ms,
-              log_bx, log_by, log_bw, log_bh_dim,
-              above_threshold);
+            crop_jpg_buf, crop_jpg_len,
+            inference_ms,
+            log_bx, log_by, log_bw, log_bh_dim,
+            above_threshold);
+    int sd_write_ms = (int)(millis() - sd_t0);
 
+    int pipeline_ms = (int)(millis() - pipeline_start);
+    
+    //debug
+    print_debug_stats(result, inference_ms, pipeline_ms,
+                fb->len, crop_jpg_len, sd_write_ms);
+
+
+    if (crop_jpg_buf) { free(crop_jpg_buf); crop_jpg_buf = nullptr; }
     esp_camera_fb_return(fb);
     update_display(disp_status, display_conf, inference_ms);
+
+
     return true;
 }
 
@@ -394,7 +456,7 @@ void handle_touch() {
 
         last_touch_debug = millis();
 
-        Serial.printf("Touch value: %d\n", val);
+        // Serial.printf("Touch value: %d\n", val);
     }
 
     bool touched = (val > TOUCH_THRESHOLD);
@@ -776,4 +838,60 @@ void serve_image() {
 
     server.streamFile(f, "image/jpeg");
     f.close();
+}
+
+void print_debug_stats(ei_impulse_result_t &result, int inference_ms,
+                       int pipeline_ms, size_t raw_jpg_len, size_t crop_jpg_len,
+                       int sd_write_ms) {
+
+    Serial.println(F("\n========== DEBUG STATS =========="));
+
+    // ── Memory ──────────────────────────────────────────────
+    Serial.printf("[MEM] Free PSRAM        : %7u bytes\n",
+        heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    Serial.printf("[MEM] PSRAM largest blk : %7u bytes\n",
+        heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+    Serial.printf("[MEM] Free heap         : %7u bytes\n",
+        heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
+    Serial.printf("[MEM] Heap largest blk  : %7u bytes\n",
+        heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+        
+    
+    Serial.printf("[MEM] Arena size        : %7u bytes  (%.1f KB)\n",
+        EI_CLASSIFIER_TFLITE_LEARN_796945_10_ARENA_SIZE,
+        EI_CLASSIFIER_TFLITE_LEARN_796945_10_ARENA_SIZE / 1024.0f);
+
+    // ── Timing ──────────────────────────────────────────────
+    Serial.printf("[TIME] Inference only   : %5d ms\n", inference_ms);
+    Serial.printf("[TIME] Full pipeline    : %5d ms  (~%.1f FPS)\n",
+        pipeline_ms, 1000.0f / pipeline_ms);
+#if EI_CLASSIFIER_HAS_ANOMALY == 1
+    Serial.printf("[TIME] Anomaly          : %5d ms\n",
+        result.timing.anomaly);
+#endif
+    Serial.printf("[TIME] DSP              : %5d ms\n", result.timing.dsp);
+    Serial.printf("[TIME] Classification   : %5d ms\n", result.timing.classification);
+
+    // ── Data / SD ────────────────────────────────────────────
+    Serial.printf("[DATA] Raw JPEG size    : %7u bytes  (%.1f KB)\n",
+        raw_jpg_len, raw_jpg_len / 1024.0f);
+    Serial.printf("[DATA] Crop JPEG size   : %7u bytes  (%.1f KB)\n",
+        crop_jpg_len, crop_jpg_len / 1024.0f);
+    Serial.printf("[DATA] SD write time    : %5d ms\n", sd_write_ms);
+    Serial.printf("[DATA] Frame #          : %lu\n", frame_counter);
+    Serial.printf("[DATA] Session          : %lu\n", session_id);
+
+    // ── Detection results ────────────────────────────────────
+    Serial.printf("[DET]  BB count         : %u\n", result.bounding_boxes_count);
+    for (uint32_t i = 0; i < result.bounding_boxes_count; i++) {
+        auto bb = result.bounding_boxes[i];
+        if (bb.value == 0) continue;
+        Serial.printf("[DET]  [%u] %-10s  conf: %.4f  x:%d y:%d w:%d h:%d\n",
+            i, bb.label, bb.value, bb.x, bb.y, bb.width, bb.height);
+    }
+    if (result.bounding_boxes_count == 0) {
+        Serial.println("[DET]  No detections");
+    }
+
+    Serial.println(F("=================================\n"));
 }
