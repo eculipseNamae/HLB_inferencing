@@ -43,7 +43,7 @@ InferenceResult InferenceManager::runInference(camera_fb_t* fb, unsigned long pi
     }
 
     fmt2jpg(global_crop_buf, CROP_W * CROP_H * 3, CROP_W, CROP_H,
-            PIXFORMAT_RGB888, 12, &res.crop_jpg_buf, &res.crop_jpg_len);
+            PIXFORMAT_RGB888, 100, &res.crop_jpg_buf, &res.crop_jpg_len);
 
     ei::image::processing::crop_and_interpolate_rgb888(
         global_crop_buf, CROP_W, CROP_H,
