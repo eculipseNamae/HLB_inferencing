@@ -1,9 +1,12 @@
 #include "InferenceManager.h"
 #include "Config.h"
 #include "esp_heap_caps.h"
+#include <HLB8_inferencing.h>
+#include "edge-impulse-sdk/dsp/image/image.hpp"
 
 // Global pointer needed because signal.get_data requires a function pointer (no captures)
 static uint8_t* global_crop_buf = nullptr;
+static ei_impulse_result_t global_ei_result = {0};
 
 InferenceResult InferenceManager::runInference(camera_fb_t* fb, unsigned long pipeline_start) {
     InferenceResult res = {0};
@@ -63,7 +66,7 @@ InferenceResult InferenceManager::runInference(camera_fb_t* fb, unsigned long pi
     };
 
     unsigned long t0 = millis();
-    EI_IMPULSE_ERROR err = run_classifier(&signal, &res.ei_result, false);
+    EI_IMPULSE_ERROR err = run_classifier(&signal, &global_ei_result, false);
     res.inference_ms = (int)(millis() - t0);
 
     free(snapshot_buf); 
@@ -81,8 +84,8 @@ InferenceResult InferenceManager::runInference(camera_fb_t* fb, unsigned long pi
     res.log_bg = 0; res.log_bh = 0; res.log_bo = 0;
     res.bx = 0; res.by = 0; res.bw = 0; res.bh_dim = 0;
 
-    for (uint32_t i = 0; i < res.ei_result.bounding_boxes_count; i++) {
-        auto bb = res.ei_result.bounding_boxes[i];
+    for (uint32_t i = 0; i < global_ei_result.bounding_boxes_count; i++) {
+        auto bb = global_ei_result.bounding_boxes[i];
         if (bb.value == 0) continue;
         if (String(bb.label) == "Greening") {
             if (bb.value > res.log_bg) {
@@ -141,10 +144,10 @@ void InferenceManager::printDebugStats(const InferenceResult& res, int sd_write_
     Serial.printf("[TIME] Inference only   : %5d ms\n", res.inference_ms);
     Serial.printf("[TIME] Full pipeline    : %5d ms  (~%.1f FPS)\n", res.pipeline_ms, 1000.0f / res.pipeline_ms);
 #if EI_CLASSIFIER_HAS_ANOMALY == 1
-    Serial.printf("[TIME] Anomaly          : %5d ms\n", res.ei_result.timing.anomaly);
+    Serial.printf("[TIME] Anomaly          : %5d ms\n", global_ei_result.timing.anomaly);
 #endif
-    Serial.printf("[TIME] DSP              : %5d ms\n", res.ei_result.timing.dsp);
-    Serial.printf("[TIME] Classification   : %5d ms\n", res.ei_result.timing.classification);
+    Serial.printf("[TIME] DSP              : %5d ms\n", global_ei_result.timing.dsp);
+    Serial.printf("[TIME] Classification   : %5d ms\n", global_ei_result.timing.classification);
 
     Serial.printf("[DATA] Raw JPEG size    : %7u bytes  (%.1f KB)\n", res.raw_jpg_len, res.raw_jpg_len / 1024.0f);
     Serial.printf("[DATA] Crop JPEG size   : %7u bytes  (%.1f KB)\n", res.crop_jpg_len, res.crop_jpg_len / 1024.0f);
@@ -152,14 +155,14 @@ void InferenceManager::printDebugStats(const InferenceResult& res, int sd_write_
     Serial.printf("[DATA] Frame #          : %lu\n", frame_counter);
     Serial.printf("[DATA] Session          : %lu\n", session_id);
 
-    Serial.printf("[DET]  BB count         : %u\n", res.ei_result.bounding_boxes_count);
-    for (uint32_t i = 0; i < res.ei_result.bounding_boxes_count; i++) {
-        auto bb = res.ei_result.bounding_boxes[i];
+    Serial.printf("[DET]  BB count         : %u\n", global_ei_result.bounding_boxes_count);
+    for (uint32_t i = 0; i < global_ei_result.bounding_boxes_count; i++) {
+        auto bb = global_ei_result.bounding_boxes[i];
         if (bb.value == 0) continue;
         Serial.printf("[DET]  [%u] %-10s  conf: %.4f  x:%d y:%d w:%d h:%d\n",
             i, bb.label, bb.value, bb.x, bb.y, bb.width, bb.height);
     }
-    if (res.ei_result.bounding_boxes_count == 0) {
+    if (global_ei_result.bounding_boxes_count == 0) {
         Serial.println("[DET]  No detections");
     }
 

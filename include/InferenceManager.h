@@ -3,8 +3,6 @@
 #define INFERENCE_MANAGER_H
 
 #include <Arduino.h>
-#include <HLB8_inferencing.h>
-#include "edge-impulse-sdk/dsp/image/image.hpp"
 #include "esp_camera.h"
 
 struct InferenceResult {
@@ -13,14 +11,13 @@ struct InferenceResult {
     int pipeline_ms;
     size_t raw_jpg_len;
     size_t crop_jpg_len;
-    float bg, bh, bo;
+    float log_bg, log_bh, log_bo;
     int bx, by, bw, bh_dim;
     const char* log_status;
     const char* disp_status;
     float display_conf;
     bool above_threshold;
     uint8_t* crop_jpg_buf;
-    ei_impulse_result_t ei_result;
 };
 
 class InferenceManager {
