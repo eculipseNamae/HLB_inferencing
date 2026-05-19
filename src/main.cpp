@@ -297,7 +297,7 @@ bool run_pipeline() {
     crop_jpg_buf = nullptr;
     crop_jpg_len = 0;
     fmt2jpg(crop_buf, CROP_W * CROP_H * 3, CROP_W, CROP_H,
-            PIXFORMAT_RGB888, 12, &crop_jpg_buf, &crop_jpg_len);
+            PIXFORMAT_RGB888, 100, &crop_jpg_buf, &crop_jpg_len);
 
     // ── Resize crop in-place to 96x96 for inference ──
     ei::image::processing::crop_and_interpolate_rgb888(
