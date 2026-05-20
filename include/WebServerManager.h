@@ -17,6 +17,7 @@ public:
 private:
     static void serveDashboard();
     static void serveSessions();
+    static void serveSessionDetails();
     static void serveCsv();
     static void serveImage();
     
